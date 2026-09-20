@@ -1,6 +1,7 @@
 # Design material is deliberately kept out of git and carried between machines
 # by hand. GitHub holds code only. See CLAUDE.md.
-docs/
+docs/*
+!docs/.gitkeep
 
 # Research sources live in an external service.
 Research/*
