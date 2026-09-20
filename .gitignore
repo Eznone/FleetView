@@ -1,2 +1,16 @@
+# Design material is deliberately kept out of git and carried between machines
+# by hand. GitHub holds code only. See CLAUDE.md.
+docs/
+
+# Research sources live in an external service.
 Research/*
 !Research/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.coverage
