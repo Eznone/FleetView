@@ -36,9 +36,14 @@ quota wall.
 
 ## Status
 
-Early. **Phase 0 is complete**: a CLI spawned from a daemon-like process authenticates on the
-operator's subscription, saves a transcript and resumes. Phase 1 — the event spine — is in
-progress. There is no UI yet.
+Early, and usable only from the command line. There is no UI yet.
+
+**Phase 0 is complete**: a CLI spawned from a daemon-like process authenticates on the operator's
+subscription, saves a transcript and resumes.
+
+**Phase 1 — the event spine — is partly done.** A spawned agent reports its whole lifecycle into a
+local SQLite store, which you can read back with `fleetview events tail`. Still to come: the
+terminal plane, and the live canvas that makes any of this worth looking at.
 
 ## Development
 
@@ -50,12 +55,18 @@ uv pip install -e ".[dev]"
 .venv/bin/python -m pytest
 ```
 
-Drive the Phase 0 spike by hand:
+Drive it by hand:
 
 ```sh
-.venv/bin/fleetview env claude                          # inspect the env an agent would receive
-.venv/bin/fleetview spike claude --cwd /path/to/project # spawn one agent in detached tmux
-tmux attach -t <session>
+.venv/bin/fleetview env claude          # inspect the env an agent would receive
+.venv/bin/fleetview init                # create ~/.fleetview
+.venv/bin/fleetview daemon              # run the daemon (foreground)
+
+# ...in another shell: spawn an agent that reports to it
+.venv/bin/fleetview spike claude --cwd /path/to/project --hooks
+tmux attach -t <session>                # drive the agent
+
+.venv/bin/fleetview events tail --agent <session> -f    # watch its events
 ```
 
 Two notes if you are working on this:
