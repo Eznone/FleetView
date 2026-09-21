@@ -21,7 +21,8 @@ from pathlib import Path
 import typer
 
 from fleetview.config import Settings
-from fleetview.fsguard import SLOW_FILESYSTEMS, filesystem_type
+from fleetview.fsguard import SLOW_FILESYSTEMS, SlowFilesystemError, filesystem_type
+from fleetview.hook.install import write_agent_settings
 from fleetview.spawn.env import build_agent_env
 from fleetview.spawn.resolve import resolve_cli_binary, user_path
 from fleetview.spawn.tmux import AgentSpawnError, create_agent_session
@@ -61,6 +62,7 @@ def spike(
     cwd: Path = typer.Option(Path.cwd(), "--cwd", help="Working directory for the agent."),
     resume: str | None = typer.Option(None, "--resume", help="Resume a prior session id."),
     name: str | None = typer.Option(None, "--name", help="tmux session name."),
+    hooks: bool = typer.Option(False, "--hooks", help="Install FleetView's hooks for this agent."),
 ) -> None:
     """Spawn one agent CLI in a detached tmux session."""
     if provider not in PROVIDER_ARGV:
@@ -78,10 +80,24 @@ def spike(
     if resume:
         argv += ["--resume", resume]
 
-    env = build_agent_env(dict(os.environ), agent_env={
+    settings = Settings.from_env()
+    agent_env = {
         "FLEETVIEW_AGENT_ID": session_name,
+        "FLEETVIEW_HOME": str(settings.home),
+        "FLEETVIEW_PROVIDER": provider,
         "PATH": user_path(),
-    })
+    }
+
+    settings_path = None
+    if hooks:
+        if provider != "claude":
+            # Codex has no --settings equivalent; its hooks ride in through a
+            # per-agent CODEX_HOME instead (§6.2). Phase 4.
+            raise typer.BadParameter(f"--hooks is Claude-only for now (got {provider!r})")
+        settings_path = write_agent_settings(session_name, settings=settings)
+        argv += ["--settings", str(settings_path)]
+
+    env = build_agent_env(dict(os.environ), agent_env=agent_env)
 
     try:
         create_agent_session(session_name=session_name, argv=argv, cwd=str(cwd), env=env)
@@ -94,6 +110,8 @@ def spike(
     typer.echo(f"  cwd      {cwd}")
     typer.echo(f"  attach   tmux attach -t {session_name}")
     typer.echo(f"  kill     tmux kill-session -t {session_name}")
+    if settings_path:
+        typer.echo(f"  hooks    {settings_path}")
     typer.echo()
     typer.echo("  Transcript should appear under:")
     typer.echo(f"    ~/.claude/projects/{str(cwd).replace('/', '-').replace('.', '-')}/")
@@ -199,6 +217,22 @@ def init() -> None:
     typer.echo(f"  store    {settings.db_path}")
     typer.echo(f"  terminal {settings.terminal_log_dir}  (flat files — never in the DB)")
     typer.echo(f"  agents   max {settings.max_concurrent_active_agents} concurrent")
+
+
+
+@app.command()
+def daemon() -> None:
+    """Run the FleetView daemon. Serves the hook plane over a Unix socket."""
+    from fleetview.daemon.server import serve
+
+    settings = Settings.from_env()
+    try:
+        asyncio.run(serve(settings))
+    except SlowFilesystemError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+    except KeyboardInterrupt:  # pragma: no cover - interactive
+        typer.echo("daemon stopped")
 
 
 if __name__ == "__main__":
