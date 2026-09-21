@@ -1,25 +1,35 @@
-"""Throwaway CLI for driving the Phase 0 spike by hand.
+"""The `fleetview` command line.
 
-Phase 0 proves one thing: that we can spawn a vendor CLI from a daemon-like
-process and have it authenticate on the operator's own subscription, save a
-transcript, and resume. This module is scaffolding for that experiment and is
-expected to be replaced by the real daemon in Phase 1.
+Two eras live here at the moment. ``spike`` and ``env`` are Phase 0 scaffolding
+— they proved that a vendor CLI spawned from a daemon-like process
+authenticates on the operator's own subscription, saves a transcript and
+resumes, and they stay as the hand-driver until the daemon owns spawning.
+
+``init`` and ``events tail`` are Phase 1: the data directory and the log
+reader. §4.1 makes the reader a deliverable rather than a nicety — SQLite is
+the single copy, so without it there is no way to inspect a run without the UI.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import secrets
-import subprocess
 from pathlib import Path
 
 import typer
 
+from fleetview.config import Settings
+from fleetview.fsguard import SLOW_FILESYSTEMS, filesystem_type
 from fleetview.spawn.env import build_agent_env
 from fleetview.spawn.resolve import resolve_cli_binary, user_path
 from fleetview.spawn.tmux import AgentSpawnError, create_agent_session
+from fleetview.store import EventStore, apply_schema, connect
 
-app = typer.Typer(add_completion=False, help="FleetView — Phase 0 spike driver.")
+app = typer.Typer(add_completion=False, help="FleetView — orchestrate and observe coding agents.")
+events_app = typer.Typer(help="Read the event log.")
+app.add_typer(events_app, name="events")
 
 #: Permission posture per PROJECT_PLAN.md §3.5.1: moderate, NOT full bypass.
 #: Both reference implementations default to bypass because a headless worker
@@ -33,19 +43,14 @@ PROVIDER_ARGV: dict[str, list[str]] = {
 
 def _warn_if_slow_filesystem(path: Path) -> None:
     """WSL2: /mnt/c is a 9p mount where file locking is unreliable and fsync is
-    glacial. Harmless for a spike, fatal for the Phase 1 SQLite store — worth
-    surfacing early either way."""
-    try:
-        fstype = subprocess.run(
-            ["findmnt", "-no", "FSTYPE", "--target", str(path)],
-            capture_output=True, text=True, timeout=3, check=False,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return
-    if fstype in {"9p", "drvfs", "cifs"}:
+    glacial. Fine for an agent's *working* directory, fatal for the event store
+    — so here it is a warning, while `fsguard` refuses outright for the store.
+    One implementation of "which filesystem is this", used by both."""
+    fstype = filesystem_type(path)
+    if fstype in SLOW_FILESYSTEMS:
         typer.secho(
-            f"  warning: {path} is on a {fstype} filesystem. Fine for this spike, but the "
-            f"Phase 1 event store must live on ext4 (~/.fleetview/).",
+            f"  warning: {path} is on a {fstype} filesystem. Workable as a working directory, "
+            f"but the event store must live on ext4 (~/.fleetview/).",
             fg=typer.colors.YELLOW,
         )
 
@@ -115,6 +120,85 @@ def env(provider: str = typer.Argument("claude")) -> None:
     typer.echo(f"  {len(stripped)} parent variables withheld, including:")
     for key in [k for k in stripped if k.startswith(("CLAUDE", "CODEX", "ANTHROPIC", "OPENAI"))][:8]:
         typer.echo(f"    - {key}")
+
+
+# --- event log reader --------------------------------------------------------
+#
+# §4.1: SQLite stays the single copy, and this recovers the greppability a
+# JSONL-only design would have given for free. That transparency matters
+# disproportionately here, because the thing being debugged *is* the debugger.
+
+@events_app.command("tail")
+def events_tail(
+    run: str | None = typer.Option(None, "--run", help="Filter by run id."),
+    agent: str | None = typer.Option(None, "--agent", help="Filter by agent id."),
+    event_type: str | None = typer.Option(None, "--type", help="Filter by event type."),
+    grep: str | None = typer.Option(None, "--grep", help="Substring match on payload or type."),
+    limit: int = typer.Option(100, "--limit", help="Most recent N events."),
+    follow: bool = typer.Option(False, "--follow", "-f", help="Stream new events as they land."),
+) -> None:
+    """Emit matching events as JSONL on stdout."""
+    settings = Settings.from_env()
+    if not settings.db_path.exists():
+        typer.secho(
+            f"no event store at {settings.db_path} — start the daemon first.",
+            fg=typer.colors.YELLOW, err=True,
+        )
+        raise typer.Exit(1)
+
+    try:
+        asyncio.run(_tail(settings, run, agent, event_type, grep, limit, follow))
+    except KeyboardInterrupt:  # pragma: no cover - interactive
+        pass
+
+
+async def _tail(settings, run, agent, event_type, grep, limit, follow) -> None:
+    conn = await connect(settings.db_path)
+    store = EventStore(conn, settings=settings)
+    try:
+        filters = dict(run_id=run, agent_id=agent, event_type=event_type, grep=grep)
+        events = await store.fetch(**filters, limit=limit, newest=True)
+        for event in events:
+            _emit(event)
+
+        if not follow:
+            return
+
+        # Poll rather than subscribe: the bus lives in the daemon's process,
+        # and a reader that needed the daemon running would be useless for
+        # exactly the post-mortem case this command exists for.
+        last_id = events[-1].id if events else ""
+        while True:
+            await asyncio.sleep(0.25)
+            new = await store.fetch(**filters, after_id=last_id, limit=500)
+            for event in new:
+                _emit(event)
+            if new:
+                last_id = new[-1].id
+    finally:
+        await conn.close()
+
+
+def _emit(event) -> None:
+    print(json.dumps(event.to_wire(), separators=(",", ":")), flush=True)
+
+
+@app.command()
+def init() -> None:
+    """Create the data directory and event store. Refuses a slow filesystem."""
+    settings = Settings.from_env()
+    settings.ensure_directories()
+
+    async def _create() -> None:
+        conn = await connect(settings.db_path)
+        await apply_schema(conn)
+        await conn.close()
+
+    asyncio.run(_create())
+    typer.secho(f"initialised {settings.home}", fg=typer.colors.GREEN)
+    typer.echo(f"  store    {settings.db_path}")
+    typer.echo(f"  terminal {settings.terminal_log_dir}  (flat files — never in the DB)")
+    typer.echo(f"  agents   max {settings.max_concurrent_active_agents} concurrent")
 
 
 if __name__ == "__main__":
