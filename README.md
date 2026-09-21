@@ -41,9 +41,19 @@ Early, and usable only from the command line. There is no UI yet.
 **Phase 0 is complete**: a CLI spawned from a daemon-like process authenticates on the operator's
 subscription, saves a transcript and resumes.
 
-**Phase 1 — the event spine — is partly done.** A spawned agent reports its whole lifecycle into a
-local SQLite store, which you can read back with `fleetview events tail`. Still to come: the
-terminal plane, and the live canvas that makes any of this worth looking at.
+**Phase 1 — the event spine — is complete.** There are two telemetry planes, and they answer
+different questions:
+
+- **The event plane.** A spawned agent reports its whole lifecycle — session start, prompts, every
+  tool call, idle, blocked — into a local SQLite store, readable with `fleetview events tail`.
+  Sustains 1000 events/s with a flat ingest backlog.
+- **The terminal plane.** `tmux pipe-pane` taps each agent's pane into rotating flat files, so you
+  can replay exactly what an agent's screen said, ANSI and all, with `fleetview terminal tail`.
+  The raw bytes **never** enter the database — it stores only where to find them, which a test
+  asserts at the byte level. Logs are capped per agent (48 h / 200 MB) by the writer itself, so a
+  runaway agent truncates its own log rather than filling your disk.
+
+Still to come: the live canvas that makes any of this worth looking at.
 
 ## Development
 
@@ -67,14 +77,35 @@ Drive it by hand:
 tmux attach -t <session>                # drive the agent
 
 .venv/bin/fleetview events tail --agent <session> -f    # watch its events
+.venv/bin/fleetview terminal tail <session> -f         # watch its raw output
+.venv/bin/fleetview terminal ls                        # what has been captured
 ```
 
-Two notes if you are working on this:
+If a tap is empty and it is not obvious which half is broken, start here — it pushes a sentinel
+through the whole pipeline with no agent, no tmux and no daemon:
+
+```sh
+.venv/bin/fleetview terminal selftest
+```
+
+The full suite is `pytest`; the sustained-throughput gate is separate, because it drives a real
+daemon for about twenty seconds:
+
+```sh
+.venv/bin/python -m pytest -m load
+```
+
+Three notes if you are working on this:
 
 - The event store lives under `~/.fleetview/` and must be on **ext4**. On WSL2 it must never sit
   under `/mnt/c` — a 9p mount where SQLite's locking is unreliable. The daemon refuses to start if
   it does.
-- Hook payloads carry tool arguments, which can include file contents. Redaction lands in Phase 6;
-  until then the store is local-only and unredacted.
+- Hook payloads carry tool arguments, which can include file contents — and captured terminal
+  bytes are whatever the agent's screen showed, which can include a sign-in URL or a token the
+  agent echoed. Redaction lands in Phase 6. Until then the data is local-only and unredacted, and
+  everything under `~/.fleetview/` is created `0700` (files `0600`). `fleetview init` prints the
+  modes so you can see it rather than assume it.
+- Keep `FLEETVIEW_HOME` short. A Unix socket path is limited to 107 bytes by the kernel; past that
+  the daemon refuses to start and says so.
 
 Design documentation is deliberately kept out of this repository. See `CLAUDE.md`.
