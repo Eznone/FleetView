@@ -2,5 +2,12 @@
 
 from fleetview.store.db import apply_schema, connect
 from fleetview.store.events import EventStore
+from fleetview.store.terminal import TerminalChunk, TerminalChunkStore
 
-__all__ = ["EventStore", "apply_schema", "connect"]
+__all__ = [
+    "EventStore",
+    "TerminalChunk",
+    "TerminalChunkStore",
+    "apply_schema",
+    "connect",
+]

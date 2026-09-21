@@ -44,6 +44,28 @@ class EventType(StrEnum):
 
     TERMINAL_STATUS_CHANGED = "terminal.status_changed"
 
+    #: Channel B lifecycle (§3.4). These describe the *tap* -- never the bytes.
+    #: Bytes live in flat files (§4.1 tier 2) and are indexed by
+    #: `terminal_chunks`; a chunk deliberately emits no event, because one
+    #: event per chunk would put the byte rate back into the event log and
+    #: duplicate an index that is already keyed (agent_id, id).
+    TERMINAL_TAP_OPENED = "terminal.tap.opened"
+    TERMINAL_TAP_CLOSED = "terminal.tap.closed"
+    #: A pipe that reported success and captured nothing. Phase 0 finding F2 is
+    #: this project's signature bug shape -- success reported, work not done --
+    #: so an unverified tap is an event, not a log line.
+    TERMINAL_TAP_FAILED = "terminal.tap.failed"
+    TERMINAL_SEGMENT_ROTATED = "terminal.segment.rotated"
+    #: §9 risk 8's degradation, made loud. The writer enforces the size cap, so
+    #: when it cannot prune it stops writing rather than filling the disk.
+    TERMINAL_TRUNCATED = "terminal.truncated"
+    TERMINAL_RESUMED = "terminal.resumed"
+    #: Bytes were lost between the reader and the writer -- the bus dropped
+    #: them (§2.2 topology, oldest-first overflow). Recorded rather than
+    #: silent: an undetectable hole in a "byte-for-byte authentic" file would
+    #: make every later byte_offset a lie nothing could catch.
+    TERMINAL_GAP = "terminal.gap"
+
     TASK_CREATED = "task.lifecycle.created"
     TASK_STARTED = "task.lifecycle.started"
     TASK_STATE_CHANGED = "task.lifecycle.state_changed"

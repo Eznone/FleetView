@@ -29,3 +29,11 @@ packages = ["src/fleetview"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+# The load gate drives a real daemon for ~20s, so it is out of the default run
+# -- but it must stay routinely runnable (`pytest -m load`), because a gate run
+# once and then left to rot proves nothing about the code as it is now.
+addopts = "-m 'not load'"
+markers = [
+    "load: sustained-throughput gate (PROJECT_PLAN.md §7). Run with `pytest -m load`.",
+    "tmux: needs a real tmux binary.",
+]

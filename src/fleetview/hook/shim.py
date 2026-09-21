@@ -38,15 +38,28 @@ def default_socket_path() -> str:
     return os.path.expanduser(os.path.join(home, "daemon.sock"))
 
 
-def post(body: bytes, socket_path: str, timeout: float = TIMEOUT_SECONDS) -> dict | None:
-    """POST ``body`` to the daemon over AF_UNIX. Returns the parsed reply, or None.
+def post(
+    body: bytes,
+    socket_path: str,
+    timeout: float = TIMEOUT_SECONDS,
+    *,
+    endpoint: str = _ENDPOINT,
+    method: str = "POST",
+) -> dict | None:
+    """Send ``body`` to the daemon over AF_UNIX. Returns the parsed reply, or None.
 
     Hand-rolled HTTP because the alternative is importing an HTTP client on
     every hook invocation. The request is trivially small and fully under our
     control, so there is no content negotiation to get wrong.
+
+    ``endpoint``/``method`` exist so the CLI can reuse this for the terminal
+    routes rather than growing a second AF_UNIX client. This package's rule is
+    that it imports nothing *from* FleetView and nothing from PyPI -- other
+    FleetView code importing *into* it costs the shim nothing and keeps one
+    implementation of "talk to the daemon over the socket".
     """
     request = (
-        f"POST {_ENDPOINT} HTTP/1.1\r\n"
+        f"{method} {endpoint} HTTP/1.1\r\n"
         "Host: fleetview\r\n"
         "Content-Type: application/json\r\n"
         f"Content-Length: {len(body)}\r\n"
@@ -139,3 +152,24 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def post_json(
+    payload: dict,
+    socket_path: str,
+    *,
+    endpoint: str = _ENDPOINT,
+    method: str = "POST",
+    timeout: float = TIMEOUT_SECONDS,
+) -> dict | None:
+    """:func:`post` for callers that have a dict rather than bytes.
+
+    Returns None when the daemon is not reachable, so every caller has to
+    decide what a missing daemon means. For a hook that is "stay silent"; for
+    the CLI it is a message naming the remedy.
+    """
+    try:
+        return post(json.dumps(payload).encode(), socket_path,
+                    timeout, endpoint=endpoint, method=method)
+    except Exception:
+        return None

@@ -17,12 +17,16 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, ConfigDict
+from pydantic.alias_generators import to_camel
 
 from fleetview.bus import EventBus
 from fleetview.config import Settings
 from fleetview.daemon.translate import translate
 from fleetview.ids import new_event_id
+from fleetview.spawn.tmux import TerminalTapError
+from fleetview.terminal.supervisor import NullTerminalSupervisor
 from fleetview.store import EventStore
 
 log = logging.getLogger(__name__)
@@ -53,6 +57,11 @@ def create_app(
     app.state.store = store
     app.state.bus = bus
     app.state.settings = settings or Settings()
+    # Replaced by the lifespan when the daemon runs for real. Defaulted here so
+    # an app built directly — which the tests do, and which has no FIFOs to own
+    # — still answers every route instead of raising AttributeError.
+    app.state.chunks = None
+    app.state.terminals = NullTerminalSupervisor()
     # One daemon process is one run, for now. Phase 3 scopes runs to a fleet
     # the operator actually started; until then this keeps sequences coherent.
     app.state.run_id = run_id or new_event_id()
@@ -64,6 +73,10 @@ def create_app(
             "runId": request.app.state.run_id,
             "events": await request.app.state.store.count(),
             "maxConcurrentAgents": request.app.state.settings.max_concurrent_active_agents,
+            # `pending` is the load gate's stall signal: a queue that grows
+            # monotonically is what "the daemon is not keeping up" looks like.
+            "pending": request.app.state.store.pending,
+            "terminals": request.app.state.terminals.count,
         }
 
     @app.post("/v1/events")
@@ -80,7 +93,56 @@ def create_app(
         request.app.state.store.append(event)
         return _no_opinion()
 
+    # --- the terminal plane (channel B) ------------------------------------
+    #
+    # The daemon owns the FIFO, so it owns the tap. Spawning still lives in the
+    # CLI: this route is the fast path so `fleetview spike` does not wait a
+    # reconcile interval, and tmux remains the registry either way.
+
+    @app.post("/v1/terminals", status_code=201)
+    async def attach_terminal(request: Request, body: AttachRequest) -> dict[str, Any]:
+        try:
+            handle = await request.app.state.terminals.attach(
+                body.agent_id, body.tmux_session
+            )
+        except TerminalTapError as exc:
+            # "no such session" is the caller's mistake; a tap that would not
+            # verify is a conflict with the live state of the pane.
+            status = 404 if "no tmux session" in str(exc) else 409
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+        return {
+            "agentId": handle.agent_id,
+            "tmuxSession": handle.tmux_session,
+            "fifo": str(handle.fifo),
+            "attachedAt": handle.attached_at.isoformat(),
+        }
+
+    @app.delete("/v1/terminals/{agent_id}")
+    async def detach_terminal(request: Request, agent_id: str) -> dict[str, Any]:
+        return {"detached": await request.app.state.terminals.detach(agent_id)}
+
+    @app.get("/v1/terminals")
+    async def list_terminals(request: Request) -> list[dict[str, Any]]:
+        return request.app.state.terminals.status()
+
     return app
+
+
+class AttachRequest(BaseModel):
+    """Body of POST /v1/terminals.
+
+    camelCase on the wire and ``extra="forbid"``, matching
+    :mod:`fleetview.schema.events` — a typo'd field should be a 422, not a
+    silently ignored key that leaves the caller thinking it asked for something
+    it did not.
+    """
+
+    model_config = ConfigDict(
+        alias_generator=to_camel, populate_by_name=True, extra="forbid"
+    )
+
+    agent_id: str
+    tmux_session: str
 
 
 def _no_opinion() -> dict[str, Any]:

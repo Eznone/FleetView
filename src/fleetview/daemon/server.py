@@ -13,7 +13,8 @@ from fleetview.bus import EventBus
 from fleetview.config import Settings
 from fleetview.daemon.app import create_app
 from fleetview.fsguard import require_fast_filesystem
-from fleetview.store import EventStore, apply_schema, connect
+from fleetview.store import EventStore, TerminalChunkStore, apply_schema, connect
+from fleetview.terminal.supervisor import NullTerminalSupervisor, TerminalSupervisor
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,33 @@ def clear_stale_socket(path: Path) -> bool:
     return False
 
 
+#: ``sockaddr_un.sun_path`` is 108 bytes including the terminating NUL, so a
+#: socket path may be at most 107. This is a kernel ABI constant, not a policy.
+MAX_SOCKET_PATH_BYTES = 107
+
+
+def check_socket_path(path: Path) -> None:
+    """Refuse a socket path the kernel cannot bind, with a usable message.
+
+    Left to itself this surfaces as ``OSError: AF_UNIX path too long`` from
+    deep inside uvicorn's startup, under a traceback that names neither the
+    path nor ``FLEETVIEW_HOME`` — which is the setting that actually caused it.
+    Same reasoning as the 9p refusal below: fail early and say why.
+    """
+    length = len(str(path).encode())
+    if length > MAX_SOCKET_PATH_BYTES:
+        raise SocketPathTooLongError(
+            f"socket path is {length} bytes, over the kernel's "
+            f"{MAX_SOCKET_PATH_BYTES}-byte limit for a Unix socket:\n"
+            f"  {path}\n"
+            f"Set FLEETVIEW_HOME to a shorter path (default: ~/.fleetview)."
+        )
+
+
+class SocketPathTooLongError(RuntimeError):
+    """Raised when FLEETVIEW_HOME makes the daemon socket unbindable."""
+
+
 async def serve(settings: Settings | None = None) -> None:
     settings = settings or Settings.from_env()
 
@@ -47,6 +75,7 @@ async def serve(settings: Settings | None = None) -> None:
     # The path need not exist yet — the guard resolves it either way — so the
     # error names the directory the operator actually asked for.
     require_fast_filesystem(settings.home)
+    check_socket_path(settings.socket_path)
     settings.ensure_directories()
 
     if clear_stale_socket(settings.socket_path):
@@ -72,13 +101,37 @@ async def serve(settings: Settings | None = None) -> None:
         store = EventStore(conn, bus=bus, settings=settings)
         await store.start()
 
+        chunks = TerminalChunkStore(conn, settings=settings)
+        await chunks.start()
+
+        if settings.terminal_capture_enabled:
+            terminals = TerminalSupervisor(
+                settings, chunks=chunks, events=store, bus=bus,
+                run_id=app.state.run_id,
+            )
+        else:
+            terminals = NullTerminalSupervisor()
+        await terminals.start()
+
         app.state.store = store
         app.state.bus = bus
+        app.state.chunks = chunks
+        app.state.terminals = terminals
 
         try:
             yield
         finally:
+            # This order is load-bearing, and each step pays for the one before.
+            #
+            # Terminals first: tearing a tap down detaches the pipe, drains the
+            # FIFO, indexes the final byte range and emits tap-closed. Stopping
+            # the event store before this would drop those events on the floor,
+            # and stopping the chunk store first would lose the final index row
+            # -- a byte range nothing can ever find again, because the segment
+            # file carries no index of its own.
+            await terminals.stop()
             await store.stop()      # drains the queue; never drops buffered events
+            await chunks.stop()     # ...and neither does this one
             await conn.close()      # checkpoints and removes the -wal/-shm files
             with contextlib.suppress(OSError):
                 settings.socket_path.unlink(missing_ok=True)

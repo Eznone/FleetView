@@ -216,3 +216,28 @@ def test_ordinary_notifications_are_only_a_status_change(message):
 def test_notification_with_no_message_is_not_an_intervention():
     event = translate(envelope("Notification"), default_run_id="r")
     assert event.event_type is EventType.TERMINAL_STATUS_CHANGED
+
+
+# --- socket path guard -------------------------------------------------------
+
+def test_a_too_long_socket_path_is_refused_with_a_usable_message(tmp_path):
+    """Found during Phase 1 slice C verification: a deep FLEETVIEW_HOME fails
+    as `OSError: AF_UNIX path too long` from inside uvicorn's startup, under a
+    traceback that names neither the path nor the setting that caused it.
+
+    sun_path is a 108-byte kernel ABI limit, so this can only be refused, not
+    worked around — but it can be refused legibly."""
+    from fleetview.config import Settings
+    from fleetview.daemon.server import SocketPathTooLongError, check_socket_path
+
+    deep = Settings(home=tmp_path / ("d" * 120))
+    with pytest.raises(SocketPathTooLongError, match="FLEETVIEW_HOME"):
+        check_socket_path(deep.socket_path)
+
+
+def test_an_ordinary_socket_path_is_allowed(tmp_path):
+    from fleetview.config import Settings
+    from fleetview.daemon.server import check_socket_path
+
+    check_socket_path(Settings(home=tmp_path).socket_path)      # must not raise
+    check_socket_path(Settings().socket_path)                   # ~/.fleetview

@@ -238,6 +238,18 @@ class EventStore:
         events = [_row_to_event(row) for row in rows]
         return list(reversed(events)) if newest else events
 
+    @property
+    def pending(self) -> int:
+        """Events enqueued but not yet committed.
+
+        Exposed rather than left as a private queue because it is the ingest
+        path's stall signal: throughput that looks fine while this grows
+        monotonically means the daemon is buffering, not keeping up. The load
+        gate asserts on it, and a test reaching into ``_queue`` would pin a
+        private.
+        """
+        return self._queue.qsize()
+
     async def count(self) -> int:
         async with self._conn.execute("SELECT COUNT(*) AS n FROM events") as cursor:
             row = await cursor.fetchone()
