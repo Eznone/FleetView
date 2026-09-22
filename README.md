@@ -36,7 +36,19 @@ quota wall.
 
 ## Status
 
-Early, and usable only from the command line. There is no UI yet.
+**Phase 2 — the live canvas — is complete.** There is a UI: run the daemon and open
+`http://127.0.0.1:8420`.
+
+It draws every agent as a node, badged with *why* it is waiting rather than just that it is —
+running, waiting on a tool, waiting on a human, waiting on its workers, rate limited, failed —
+and draws the edges between them, highlighting the ones something is blocked behind. Selecting
+an agent gives you its raw pane, ANSI intact, and its raw event payloads. State reaches the
+browser in under 100 ms.
+
+The browser listener is **read-only and loopback-only**. Nothing that mutates anything is
+reachable over TCP: ingest and tap control stay on the Unix socket, where file permissions are
+the access control. The daemon refuses to bind anywhere but loopback and validates the `Host`
+and `Origin` headers, because a page you visit can otherwise reach a port on `127.0.0.1`.
 
 **Phase 0 is complete**: a CLI spawned from a daemon-like process authenticates on the operator's
 subscription, saves a transcript and resumes.
@@ -53,7 +65,11 @@ different questions:
   asserts at the byte level. Logs are capped per agent (48 h / 200 MB) by the writer itself, so a
   runaway agent truncates its own log rather than filling your disk.
 
-Still to come: the live canvas that makes any of this worth looking at.
+Phase 2 adds a third thing on top of both: an in-memory **projection** that folds the event log
+into live fleet state, which is what the canvas actually renders. The database is durability; it
+is never on the render path.
+
+Still to come: delegation — the operator's own Claude session assigning work to a Codex worker.
 
 ## Development
 
@@ -63,14 +79,22 @@ Requires Python 3.12+, `tmux`, and at least one vendor CLI installed and signed 
 uv venv
 uv pip install -e ".[dev]"
 .venv/bin/python -m pytest
+
+cd ui && npm install && npm run build && cd ..   # the browser UI
 ```
+
+The daemon serves the built UI if it is there and prints the command to build it if it is not.
+For frontend work, `cd ui && npm run dev` runs Vite with a proxy to the daemon, so the browser
+still sees a single origin — which matters, because a cross-origin dev server is refused by the
+same check that refuses an attacker.
 
 Drive it by hand:
 
 ```sh
 .venv/bin/fleetview env claude          # inspect the env an agent would receive
 .venv/bin/fleetview init                # create ~/.fleetview
-.venv/bin/fleetview daemon              # run the daemon (foreground)
+.venv/bin/fleetview daemon              # run the daemon + UI (foreground)
+                                        # → http://127.0.0.1:8420
 
 # ...in another shell: spawn an agent that reports to it
 .venv/bin/fleetview spike claude --cwd /path/to/project --hooks
@@ -95,7 +119,17 @@ daemon for about twenty seconds:
 .venv/bin/python -m pytest -m load
 ```
 
-Three notes if you are working on this:
+To see the canvas without running real agents, seed a scripted fleet — a brain blocked on two
+workers, one of them stalled on a permission prompt:
+
+```sh
+.venv/bin/fleetview demo seed          # then start the daemon
+```
+
+Every seeded event is marked `synthetic` and the UI shows a "demo data" ribbon, so it cannot be
+mistaken for a real fleet.
+
+Four notes if you are working on this:
 
 - The event store lives under `~/.fleetview/` and must be on **ext4**. On WSL2 it must never sit
   under `/mnt/c` — a 9p mount where SQLite's locking is unreliable. The daemon refuses to start if
@@ -107,5 +141,9 @@ Three notes if you are working on this:
   modes so you can see it rather than assume it.
 - Keep `FLEETVIEW_HOME` short. A Unix socket path is limited to 107 bytes by the kernel; past that
   the daemon refuses to start and says so.
+- `FLEETVIEW_UI=0` runs headless, `FLEETVIEW_UI_PORT` moves the listener, and
+  `FLEETVIEW_PROJECTION=0` switches the canvas's read side off. The last two exist so the
+  throughput gate can measure one subsystem at a time: `pytest -m load` sits almost exactly on
+  the daemon's ingest ceiling, so it is run on its own, on a settled machine.
 
 Design documentation is deliberately kept out of this repository. See `CLAUDE.md`.

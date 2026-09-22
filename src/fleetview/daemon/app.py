@@ -1,10 +1,20 @@
-"""The daemon's HTTP surface, served over a Unix socket.
+"""The hook plane's HTTP surface, served over a Unix socket.
 
 §3.3 describes the hook shim as POSTing to a Unix domain socket, and that is
 exactly what this is: an ordinary FastAPI app that uvicorn binds to
-``~/.fleetview/daemon.sock`` rather than a TCP port. Nothing is listening on
-the network, so no port needs defending — and the socket's file permissions are
-the access control.
+``~/.fleetview/daemon.sock`` rather than a TCP port. The socket's file
+permissions are the access control, and this app holds **every route that
+mutates anything** — ingest, tap attach, tap detach.
+
+That last sentence used to read "nothing is listening on the network".
+Phase 2 spends that, because a browser cannot dial an AF_UNIX socket
+(`PHASE_2.md`). What replaces it is a split rather than a weakening: the
+daemon runs a *second* listener on 127.0.0.1 (:mod:`fleetview.daemon.ui_app`)
+which is read-only, loopback-only and `Host`-validated, and which
+`test_no_mutating_route_is_reachable_over_tcp` keeps that way by walking its
+route table. Nothing below is reachable over TCP. Adding a mutating route to
+the other app dissolves the argument; the Phase 5 control plane has to make
+that case on its own terms.
 
 ``POST /v1/events`` is both the hook plane's ingest and the reply channel for
 ``PreToolUse``. The response is a *policy* decision only: Phase 1 has no policy

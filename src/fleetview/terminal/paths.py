@@ -113,3 +113,36 @@ def open_segment(directory: Path, sequence: int, *, mode: int) -> Path:
     os.close(fd)
     path.chmod(mode)
     return path
+
+
+def seek_back(segments: list[Path], n_bytes: int) -> tuple[Path, int]:
+    """Walk backwards through segments until ``n_bytes`` are covered.
+
+    Returns the segment to start reading from and the offset within it. Used
+    by both ``fleetview terminal tail`` and the UI's pane backfill, which is
+    why it lives here rather than in either caller: a tail that silently
+    disagreed with the browser about where "the last 64 KiB" starts would be a
+    difference nobody would think to look for.
+    """
+    remaining = n_bytes
+    for segment in reversed(segments):
+        size = segment.stat().st_size
+        if size >= remaining:
+            return segment, size - remaining
+        remaining -= size
+    return segments[0], 0
+
+
+def read_from(segments: list[Path], start: Path, offset: int) -> bytes:
+    """Read every byte from ``(start, offset)`` to the end of the capture.
+
+    Segments tile the stream contiguously, so this is a plain concatenation --
+    a chunk row never spans two files (`PHASE_1.md` F5), which is what makes
+    that true.
+    """
+    out = bytearray()
+    for segment in segments[segments.index(start):]:
+        with open(segment, "rb") as handle:
+            handle.seek(offset if segment == start else 0)
+            out += handle.read()
+    return bytes(out)

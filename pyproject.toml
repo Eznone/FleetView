@@ -10,6 +10,13 @@ dependencies = [
     "aiosqlite>=0.20",
     "fastapi>=0.110",
     "uvicorn>=0.29",
+    # uvicorn ships no WebSocket protocol implementation of its own and
+    # *rejects* every upgrade without one. Starlette's TestClient speaks WS
+    # in-process regardless, so omitting this leaves the suite green while the
+    # real daemon refuses the UI -- the success-reported/work-not-done shape
+    # this project keeps finding. Pinned explicitly rather than via
+    # `uvicorn[standard]`, which also drags in uvloop and httptools.
+    "websockets>=12",
 ]
 
 [project.scripts]

@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import libtmux
+from pydantic.alias_generators import to_camel
 
 from fleetview.bus import EventBus
 from fleetview.config import Settings
@@ -238,6 +239,15 @@ class TerminalSupervisor:
         )
 
     def status(self) -> list[dict[str, Any]]:
+        """One row per live tap, camelCase throughout.
+
+        ``writer.stats`` is snake_case because it is also spliced into event
+        *payloads*, which stay snake_case by design (:mod:`fleetview.schema.events`
+        aliases the envelope, never the payload). This is an HTTP response
+        rather than a payload, so it is converted here -- one object answering
+        to two spellings is a bug waiting for its second reader, and Phase 2
+        gave it one.
+        """
         return [
             {
                 "agentId": h.agent_id,
@@ -245,7 +255,7 @@ class TerminalSupervisor:
                 "fifo": str(h.fifo),
                 "attachedAt": h.attached_at.isoformat(),
                 "bytesRead": h.reader.bytes_read,
-                **h.writer.stats,
+                **{to_camel(key): value for key, value in h.writer.stats.items()},
             }
             for h in self._handles.values()
         ]

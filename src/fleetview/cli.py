@@ -32,6 +32,7 @@ from fleetview.terminal.paths import (
     UnsafeAgentIdError,
     agent_log_dir,
     list_segments,
+    seek_back,
     total_bytes,
 )
 from fleetview.spawn.env import build_agent_env
@@ -44,6 +45,8 @@ events_app = typer.Typer(help="Read the event log.")
 app.add_typer(events_app, name="events")
 terminal_app = typer.Typer(help="Read an agent's captured terminal bytes.")
 app.add_typer(terminal_app, name="terminal")
+demo_app = typer.Typer(help="Seeded data, for looking at the canvas.")
+app.add_typer(demo_app, name="demo")
 
 #: Permission posture per PROJECT_PLAN.md §3.5.1: moderate, NOT full bypass.
 #: Both reference implementations default to bypass because a headless worker
@@ -331,7 +334,7 @@ async def _terminal_tail(settings, agent, n_bytes, since, strip_ansi, follow) ->
                 raise typer.Exit(1)
             position = (Path(rows[0].path), rows[0].byte_offset)
         else:
-            position = _seek_back(segments, n_bytes)
+            position = seek_back(segments, n_bytes)
 
         path, offset = position
         for segment in segments[segments.index(path):]:
@@ -367,15 +370,6 @@ async def _terminal_tail(settings, agent, n_bytes, since, strip_ansi, follow) ->
         await conn.close()
 
 
-def _seek_back(segments: list[Path], n_bytes: int) -> tuple[Path, int]:
-    """Walk backwards through segments until n_bytes are covered."""
-    remaining = n_bytes
-    for segment in reversed(segments):
-        size = segment.stat().st_size
-        if size >= remaining:
-            return segment, size - remaining
-        remaining -= size
-    return segments[0], 0
 
 
 @terminal_app.command("ls")
@@ -527,15 +521,66 @@ async def _selftest() -> bool:
         shutil.rmtree(root, ignore_errors=True)
 
 
+@demo_app.command("seed")
+def demo_seed(
+    quota: bool = typer.Option(
+        False, "--quota", help="Also park a worker at a quota wall."
+    ),
+) -> None:
+    """Write a scripted three-agent run into the store.
+
+    The daemon builds its projection by replaying the log at startup, so a
+    daemon that is already running will not show this until it is restarted --
+    which the command says, rather than leaving an empty canvas to explain
+    itself.
+    """
+    from fleetview.demo import build_demo_events, build_quota_wall, demo_run_id
+
+    settings = Settings.from_env()
+    run_id = demo_run_id()
+    events = build_demo_events(run_id)
+    if quota:
+        events += build_quota_wall(run_id)
+
+    count = asyncio.run(_demo_seed(settings, events))
+    typer.secho(f"seeded {count} events as run {run_id}", fg=typer.colors.GREEN)
+    typer.echo("  every event is marked synthetic in its providerMetadata")
+    if settings.socket_path.exists():
+        typer.secho(
+            "  a daemon is already running — restart it to see this on the canvas",
+            fg=typer.colors.YELLOW,
+        )
+    else:
+        typer.echo(f"  start the daemon, then open http://{settings.ui_host}:{settings.ui_port}")
+
+
+async def _demo_seed(settings: Settings, events) -> int:
+    settings.ensure_directories()
+    conn = await connect(settings.db_path)
+    await apply_schema(conn)
+    store = EventStore(conn, settings=settings)
+    await store.start()
+    try:
+        for event in events:
+            store.append(event)
+        await store.flush()
+    finally:
+        await store.stop()
+        await conn.close()
+    return len(events)
+
+
 @app.command()
 def daemon() -> None:
-    """Run the FleetView daemon. Serves the hook plane over a Unix socket."""
+    """Run the FleetView daemon: the hook plane on a Unix socket, the UI on TCP."""
     from fleetview.daemon.server import SocketPathTooLongError, serve
+    from fleetview.daemon.ui_app import UiHostNotLoopbackError, UiPortInUseError
 
     settings = Settings.from_env()
     try:
         asyncio.run(serve(settings))
-    except (SlowFilesystemError, SocketPathTooLongError) as exc:
+    except (SlowFilesystemError, SocketPathTooLongError,
+            UiHostNotLoopbackError, UiPortInUseError) as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(1) from exc
     except KeyboardInterrupt:  # pragma: no cover - interactive

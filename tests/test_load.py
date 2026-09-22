@@ -21,6 +21,7 @@ import asyncio
 import json
 import os
 import signal
+import socket
 import sqlite3
 import statistics
 import subprocess
@@ -59,10 +60,22 @@ MAX_BUDGET_MS = 500
 CONCURRENCY = 4
 
 
-@pytest.fixture
-def daemon(tmp_path):
+def _free_port() -> int:
+    """An ephemeral port the UI listener can have to itself.
+
+    The daemon binds a TCP port from Phase 2 onward, so a fixed one would
+    collide with the operator's own running daemon and with the previous test
+    in the same session -- and a bind failure surfaces as "the daemon did not
+    start", which says nothing about why.
+    """
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _spawn_daemon(tmp_path, **extra_env):
     env = {**os.environ, "FLEETVIEW_HOME": str(tmp_path),
-           "FLEETVIEW_TERMINAL_CAPTURE": "0"}
+           "FLEETVIEW_TERMINAL_CAPTURE": "0", **extra_env}
     process = subprocess.Popen(
         [sys.executable, "-m", "fleetview.cli", "daemon"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -77,10 +90,40 @@ def daemon(tmp_path):
         time.sleep(0.05)
     else:
         pytest.fail("daemon did not start")
-    yield process, tmp_path
+    return process
+
+
+def _stop(process) -> None:
     if process.poll() is None:
         process.kill()
         process.wait(timeout=5)
+
+
+@pytest.fixture
+def daemon(tmp_path):
+    """The ingest path, isolated.
+
+    Terminal capture and the projection are both off, and so is the UI
+    listener -- the same reasoning in all three cases. F9 puts the ingest
+    ceiling at ~1000 events/s with this gate sitting exactly on it, so a
+    measurement that bundles every subsystem together tells you a regression
+    happened without telling you where. `test_the_gate_holds_with_a_live_ui_
+    client_attached` measures the loaded configuration separately.
+    """
+    process = _spawn_daemon(
+        tmp_path, FLEETVIEW_UI="0", FLEETVIEW_PROJECTION="0",
+    )
+    yield process, tmp_path
+    _stop(process)
+
+
+@pytest.fixture
+def ui_daemon(tmp_path):
+    """The Phase 2 configuration: projection on, UI listening, on its own port."""
+    port = _free_port()
+    process = _spawn_daemon(tmp_path, FLEETVIEW_UI="1", FLEETVIEW_UI_PORT=str(port))
+    yield process, tmp_path, port
+    _stop(process)
 
 
 def _envelope(i: int) -> dict:
@@ -205,6 +248,76 @@ def test_sustained_1k_events_per_second_without_an_ingest_stall(daemon):
           f"max {worst:.1f} ms · backlog {second_quartile:.0f}->{final_quartile:.0f}")
 
 
+def test_the_gate_holds_with_a_live_ui_client_attached(ui_daemon):
+    """The Phase 2 configuration, under the Phase 1 load.
+
+    F9 is the reason this test exists: the ingest ceiling is ~1000 events/s and
+    the gate sits exactly on it, so a WebSocket fan-out task on the same loop
+    is precisely the kind of addition that regresses it. It already did once --
+    publishing a fleet snapshot per event cost ~9% of throughput before the
+    broadcast was coalesced (`projection_broadcast_ms`).
+
+    The rate assertion is deliberately looser here than in the isolated gate.
+    That gate owns the throughput number; this one exists to catch a *stall* --
+    a growing backlog or a latency cliff -- and on this machine the run-to-run
+    spread of the same configuration is wide enough that a tight rate bound
+    here would fail for reasons that have nothing to do with the UI.
+    """
+    import websockets
+
+    process, home, port = ui_daemon
+    latencies: list[float] = []
+    statuses: list[int] = []
+    samples: list[int] = []
+    frames = 0
+
+    async def run() -> float:
+        nonlocal frames
+        async with websockets.connect(f"ws://127.0.0.1:{port}/ws/live") as socket_:
+            async def drain() -> None:
+                nonlocal frames
+                while True:
+                    await socket_.recv()
+                    frames += 1
+
+            drainer = asyncio.create_task(drain())
+            try:
+                return await _drive(home / "daemon.sock", samples, latencies, statuses)
+            finally:
+                drainer.cancel()
+
+    elapsed = asyncio.run(run())
+
+    assert frames > 0, "the client was attached but the daemon never fed it"
+    assert set(statuses) == {200}, f"non-200 responses: {set(statuses)}"
+
+    latencies.sort()
+    p99 = latencies[int(len(latencies) * 0.99)]
+    assert p99 < P99_BUDGET_MS, (
+        f"p99 POST latency {p99:.1f} ms with a UI client attached; a hook shim "
+        f"holds a worker's tool call open while this is happening"
+    )
+
+    achieved = TOTAL / elapsed
+    assert achieved >= TARGET_RATE * 0.75, (
+        f"only sustained {achieved:.0f} events/s with a UI client attached"
+    )
+
+    # The stall signal, which is what this test is really for.
+    assert samples, "never sampled the ingest backlog"
+    quarter = max(1, len(samples) // 4)
+    second_quartile = statistics.mean(samples[quarter:quarter * 2])
+    final_quartile = statistics.mean(samples[-quarter:])
+    if second_quartile > 1:
+        assert final_quartile <= second_quartile * 2, (
+            f"backlog grew monotonically ({second_quartile:.0f} -> "
+            f"{final_quartile:.0f}) with a UI client attached"
+        )
+
+    print(f"\n  with UI client: {achieved:.0f} events/s · p99 {p99:.1f} ms · "
+          f"{frames} frames · backlog {second_quartile:.0f}->{final_quartile:.0f}")
+
+
 def test_ingest_latency_is_unaffected_by_terminal_capture(tmp_path):
     """Both planes at once — the only test that exercises them together.
 
@@ -212,8 +325,12 @@ def test_ingest_latency_is_unaffected_by_terminal_capture(tmp_path):
     shells out synchronously, and a 30 ms block would land here as a p99
     regression rather than as an obvious failure anywhere else.
     """
+    # Terminal capture on, everything else off: this test is about one plane,
+    # and leaving the UI listener enabled would also make it fight the other
+    # load tests over a TCP port.
     env = {**os.environ, "FLEETVIEW_HOME": str(tmp_path),
-           "FLEETVIEW_TERMINAL_CAPTURE": "1"}
+           "FLEETVIEW_TERMINAL_CAPTURE": "1",
+           "FLEETVIEW_UI": "0", "FLEETVIEW_PROJECTION": "0"}
     process = subprocess.Popen(
         [sys.executable, "-m", "fleetview.cli", "daemon"],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,

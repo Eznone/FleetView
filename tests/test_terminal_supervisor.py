@@ -270,5 +270,9 @@ async def test_status_reports_what_the_ui_needs(tmp_path):
     (row,) = r.sup.status()
     assert row["agentId"] == "agent-1"
     assert row["tmuxSession"] == "sess-1"
-    assert "bytesRead" in row and "bytes_written" in row and "truncating" in row
+    # camelCase throughout: this is an HTTP response, and the UI reads it.
+    # `writer.stats` is snake_case at source because it also lands in event
+    # payloads, which are not aliased -- `status()` converts at the boundary.
+    assert "bytesRead" in row and "bytesWritten" in row and "truncating" in row
+    assert not any("_" in key for key in row), f"snake_case leaked: {sorted(row)}"
     await r.close()

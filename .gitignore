@@ -15,3 +15,10 @@ venv/
 *.egg-info/
 .pytest_cache/
 .coverage
+
+# Frontend. Source is tracked; the build is not -- it is generated, large, and
+# would make every UI commit unreviewable.
+ui/node_modules/
+ui/dist/
+.vite/
+*.tsbuildinfo

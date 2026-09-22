@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import socket
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 
 from fleetview.bus import EventBus
 from fleetview.config import Settings
 from fleetview.daemon.app import create_app
+from fleetview.daemon.ui_app import check_ui_host, check_ui_port, create_ui_app
 from fleetview.fsguard import require_fast_filesystem
+from fleetview.projection import ProjectionService
 from fleetview.store import EventStore, TerminalChunkStore, apply_schema, connect
 from fleetview.terminal.supervisor import NullTerminalSupervisor, TerminalSupervisor
 
@@ -70,12 +74,19 @@ class SocketPathTooLongError(RuntimeError):
 async def serve(settings: Settings | None = None) -> None:
     settings = settings or Settings.from_env()
 
+    # Populated after `create_app`, but read from inside the lifespan, which
+    # only runs once the server is started -- so the indirection is enough.
+    ui_holder: dict[str, Any] = {}
+
     # Before anything is created: §4.1's refusal. The error names the reason,
     # because the alternative is intermittent lock corruption weeks later.
     # The path need not exist yet — the guard resolves it either way — so the
     # error names the directory the operator actually asked for.
     require_fast_filesystem(settings.home)
     check_socket_path(settings.socket_path)
+    if settings.ui_enabled:
+        check_ui_host(settings.ui_host)
+        check_ui_port(settings.ui_host, settings.ui_port)
     settings.ensure_directories()
 
     if clear_stale_socket(settings.socket_path):
@@ -113,17 +124,39 @@ async def serve(settings: Settings | None = None) -> None:
             terminals = NullTerminalSupervisor()
         await terminals.start()
 
+        projection = None
+        if settings.projection_enabled:
+            projection = ProjectionService(
+                settings=settings, bus=bus, store=store, run_id=app.state.run_id,
+            )
+            await projection.start()
+
         app.state.store = store
         app.state.bus = bus
         app.state.chunks = chunks
         app.state.terminals = terminals
+        app.state.projection = projection
 
         try:
             yield
         finally:
             # This order is load-bearing, and each step pays for the one before.
             #
-            # Terminals first: tearing a tap down detaches the pipe, drains the
+            # UI sockets first, and the UI listener with them: a browser holding
+            # a pane open should see `terminal.tap.closed` arrive rather than
+            # its socket vanishing underneath it, and that event is emitted two
+            # steps below. Closing them here also stops new bus subscriptions
+            # appearing while the bus's publishers are being torn down.
+            ui = ui_holder.get("app")
+            if ui is not None:
+                await ui.state.clients.close_all()
+            ui_server = ui_holder.get("server")
+            if ui_server is not None:
+                ui_server.should_exit = True
+            if projection is not None:
+                await projection.stop()
+            #
+            # Terminals next: tearing a tap down detaches the pipe, drains the
             # FIFO, indexes the final byte range and emits tap-closed. Stopping
             # the event store before this would drop those events on the floor,
             # and stopping the chunk store first would lose the final index row
@@ -137,10 +170,51 @@ async def serve(settings: Settings | None = None) -> None:
                 settings.socket_path.unlink(missing_ok=True)
 
     app = create_app(settings=settings, lifespan=lifespan)
-    config = uvicorn.Config(
+    uds_server = uvicorn.Server(uvicorn.Config(
         app,
         uds=str(settings.socket_path),
         log_level="warning",
         access_log=False,
-    )
-    await uvicorn.Server(config).serve()
+    ))
+
+    if not settings.ui_enabled:
+        await uds_server.serve()
+        return
+
+    ui = create_ui_app(settings=settings, source=app.state)
+    ui_server = _QuietSignalServer(uvicorn.Config(
+        ui,
+        host=settings.ui_host,
+        port=settings.ui_port,
+        log_level="warning",
+        access_log=False,
+        # "auto" picks whatever WS implementation is installed. `websockets` is
+        # a hard dependency precisely so that is never "none" -- uvicorn
+        # *rejects* upgrades without one, and Starlette's TestClient speaks WS
+        # in-process regardless, so the suite would stay green while the real
+        # daemon refused every browser.
+        ws="auto",
+    ))
+    ui_holder["app"] = ui
+    ui_holder["server"] = ui_server
+
+    log.warning("FleetView UI on http://%s:%d", settings.ui_host, settings.ui_port)
+    # The hook app's lifespan owns every resource, so the UDS server is the one
+    # that must run it -- and the one that must see the signal. Two servers in
+    # one process both installing SIGTERM handlers fight over the same slot.
+    await asyncio.gather(uds_server.serve(), ui_server.serve())
+
+
+class _QuietSignalServer(uvicorn.Server):
+    """A uvicorn server that does not touch the process's signal handlers.
+
+    Only the UDS server captures signals; it drives this one's shutdown by
+    setting ``should_exit`` from inside the lifespan. Letting both install
+    handlers means the second overwrites the first, and the lifespan that owns
+    the database never runs its teardown -- which is the exact failure the
+    lifespan exists to prevent.
+    """
+
+    @contextlib.contextmanager
+    def capture_signals(self):
+        yield
